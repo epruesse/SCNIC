@@ -17,22 +17,46 @@ def df_to_correls(cor, col_label='r'):
     return correls
 
 
-def calculate_correlations(table: Table, corr_method=spearmanr, p_adjustment_method: str = 'fdr_bh') -> pd.DataFrame:
-    # TODO: multiprocess this
+def calculate_correlations(table: Table, corr_method=spearmanr, p_adjustment_method: str = 'fdr_bh', nprocs=1) -> pd.DataFrame:
+    # TODO: multiprocess this. Casey mimed Mike's pool implementation for betweeen_correls_from_tables()
     index = list()
     data = list()
-    for (val_i, id_i, _), (val_j, id_j, _) in table.iter_pairwise(axis='observation'):
-        r, p = corr_method(val_i, val_j)
-        index.append((id_i, id_j))
-        data.append((r, p))
-    correls = pd.DataFrame(data, index=index, columns=['r', 'p'])
-    correls.index = pd.MultiIndex.from_tuples(correls.index)  # Turn tuple index into actual multiindex
-    if p_adjustment_method is not None:
-        correls['p_adjusted'] = p_adjust(correls.p, method=p_adjustment_method)
+
+    if nprocs == 1:
+        for (val_i, id_i, _), (val_j, id_j, _) in table.iter_pairwise(axis='observation'):
+            r, p = corr_method(val_i, val_j)
+            index.append((id_i, id_j))
+            data.append((r, p))
+        correls = pd.DataFrame(data, index=index, columns=['r', 'p'])
+        correls.index = pd.MultiIndex.from_tuples(correls.index)  # Turn tuple index into actual multiindex
+        if p_adjustment_method is not None:
+            correls['p_adjusted'] = p_adjust(correls.p, method=p_adjustment_method)
+        return correls
+    else:
+        import multiprocessing
+        if nprocs > multiprocessing.cpu_count():
+            warnings.warn("nprocs greater than CPU count, using all avaliable CPUs")
+            nprocs = multiprocessing.cpu_count()
+
+        pool = multiprocessing.Pool(nprocs)
+        for val_i, id_i, _ in table.iter(axis="observation"):
+            vals_j = (val_j for val_j, id_j, _ in table.iter(axis="observation"))
+            corr = partial(corr_method, b=val_i)
+            corrs = pool.map(corr, vals_j)
+            data += [(id_i, table.ids(axis="observation")[n], corrs[n][0], corrs[n][1])
+                        for n in range(len(corrs))]
+        pool.close()
+        pool.join()
+    correls = pd.DataFrame(data, columns=['feature1', 'feature2', 'r', 'p'])
+    # NEEDS REVIEW: Workaround to the multiindex issue in between_two_correls_from_tables()
+    index = list(zip(correls['feature1'], correls['feature2']))
+    correls.index = pd.MultiIndex.from_tuples(index)
+    correls.drop(columns=['feature1','feature2'])
     return correls
 
 
-def fastspar_correlation(table: Table, verbose: bool=False) -> pd.DataFrame:
+
+def fastspar_correlation(table: Table, nprocs=1, verbose: bool=False) -> pd.DataFrame:
     # TODO: multiprocess support
     with tempfile.TemporaryDirectory(prefix='fastspar') as temp:
         table.to_dataframe().to_dense().to_csv(path.join(temp, 'otu_table.tsv'), sep='\t', index_label='#OTU ID')
@@ -42,7 +66,7 @@ def fastspar_correlation(table: Table, verbose: bool=False) -> pd.DataFrame:
             stdout = subprocess.DEVNULL
         subprocess.run(['fastspar', '-c',  path.join(temp, 'otu_table.tsv'), '-r',
                         path.join(temp, path.join(temp, 'correl_table.tsv')), '-a',
-                        path.join(temp, 'covar_table.tsv')], stdout=stdout)
+                        path.join(temp, 'covar_table.tsv'), '-t', str(nprocs)], stdout=stdout)
         cor = pd.read_table(path.join(temp, 'correl_table.tsv'), index_col=0)
         return df_to_correls(cor)
 
